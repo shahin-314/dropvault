@@ -1,3 +1,4 @@
+
 const express = require("express");
 const multer = require("multer");
 const supabase = require("../config/supabase");
@@ -27,12 +28,11 @@ router.post(
             }
 
             const userId = req.user.userId;
-
             const fileId = require("crypto").randomUUID();
 
-            const storagePath = `${userId}/${fileId}-${req.file.originalname}`;
+            const storagePath =
+                `${userId}/${fileId}-${req.file.originalname}`;
 
-            // 1. Upload to Supabase Storage
             const { data, error } = await supabase.storage
                 .from("files")
                 .upload(storagePath, req.file.buffer, {
@@ -48,7 +48,6 @@ router.post(
                 });
             }
 
-            // 2. Save file information in database
             const result = await pool.query(
                 `INSERT INTO files
                 (id, user_id, original_name, storage_path, mime_type, file_size)
@@ -94,6 +93,7 @@ router.get(
                 `SELECT id, original_name, mime_type, file_size, created_at
                  FROM files
                  WHERE user_id = $1
+                 AND deleted_at IS NULL
                  ORDER BY created_at DESC`,
                 [userId]
             );
@@ -113,6 +113,9 @@ router.get(
 );
 
 
+// ===============================
+// MOVE FILE TO TRASH
+// ===============================
 router.delete(
     "/:fileId",
     authenticateToken,
@@ -121,23 +124,144 @@ router.delete(
             const { fileId } = req.params;
             const userId = req.user.userId;
 
-            // Find file and verify ownership
             const result = await pool.query(
-                `SELECT *
-                 FROM files
-                 WHERE id = $1 AND user_id = $2`,
+                `UPDATE files
+                 SET deleted_at = NOW()
+                 WHERE id = $1
+                 AND user_id = $2
+                 AND deleted_at IS NULL
+                 RETURNING id, original_name, deleted_at`,
                 [fileId, userId]
             );
 
             if (result.rows.length === 0) {
                 return res.status(404).json({
-                    error: "File not found"
+                    error: "File not found or already in Trash"
+                });
+            }
+
+            res.json({
+                message: "File moved to Trash successfully",
+                file: result.rows[0]
+            });
+
+        } catch (error) {
+            console.error("MOVE TO TRASH ERROR:", error);
+
+            res.status(500).json({
+                error: "Internal server error"
+            });
+        }
+    }
+);
+
+
+// ===============================
+// GET TRASH FILES
+// ===============================
+router.get(
+    "/trash",
+    authenticateToken,
+    async (req, res) => {
+        try {
+            const userId = req.user.userId;
+
+            const result = await pool.query(
+                `SELECT id, original_name, mime_type, file_size,
+                        created_at, deleted_at
+                 FROM files
+                 WHERE user_id = $1
+                 AND deleted_at IS NOT NULL
+                 ORDER BY deleted_at DESC`,
+                [userId]
+            );
+
+            res.json({
+                files: result.rows
+            });
+
+        } catch (error) {
+            console.error("TRASH LIST ERROR:", error);
+
+            res.status(500).json({
+                error: "Internal server error"
+            });
+        }
+    }
+);
+
+
+// ===============================
+// RESTORE FILE FROM TRASH
+// ===============================
+router.patch(
+    "/:fileId/restore",
+    authenticateToken,
+    async (req, res) => {
+        try {
+            const { fileId } = req.params;
+            const userId = req.user.userId;
+
+            const result = await pool.query(
+                `UPDATE files
+                 SET deleted_at = NULL
+                 WHERE id = $1
+                 AND user_id = $2
+                 AND deleted_at IS NOT NULL
+                 RETURNING id, original_name, deleted_at`,
+                [fileId, userId]
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    error: "File not found in Trash"
+                });
+            }
+
+            res.json({
+                message: "File restored successfully",
+                file: result.rows[0]
+            });
+
+        } catch (error) {
+            console.error("RESTORE FILE ERROR:", error);
+
+            res.status(500).json({
+                error: "Internal server error"
+            });
+        }
+    }
+);
+
+
+// ===============================
+// PERMANENTLY DELETE FILE
+// ===============================
+router.delete(
+    "/:fileId/permanent",
+    authenticateToken,
+    async (req, res) => {
+        try {
+            const { fileId } = req.params;
+            const userId = req.user.userId;
+
+            const result = await pool.query(
+                `SELECT id, storage_path
+                 FROM files
+                 WHERE id = $1
+                 AND user_id = $2
+                 AND deleted_at IS NOT NULL`,
+                [fileId, userId]
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    error: "File not found in Trash"
                 });
             }
 
             const file = result.rows[0];
 
-            // Delete actual file from Supabase Storage
             const { error: storageError } = await supabase.storage
                 .from("files")
                 .remove([file.storage_path]);
@@ -150,18 +274,20 @@ router.delete(
                 });
             }
 
-            // Delete metadata from PostgreSQL
             await pool.query(
-                "DELETE FROM files WHERE id = $1 AND user_id = $2",
+                `DELETE FROM files
+                 WHERE id = $1
+                 AND user_id = $2
+                 AND deleted_at IS NOT NULL`,
                 [fileId, userId]
             );
 
             res.json({
-                message: "File deleted successfully"
+                message: "File permanently deleted"
             });
 
         } catch (error) {
-            console.error("DELETE ERROR:", error);
+            console.error("PERMANENT DELETE ERROR:", error);
 
             res.status(500).json({
                 error: "Internal server error"
@@ -169,6 +295,7 @@ router.delete(
         }
     }
 );
+
 
 // ===============================
 // DOWNLOAD FILE
@@ -181,12 +308,14 @@ router.get(
             const { fileId } = req.params;
             const userId = req.user.userId;
 
-            // Only get a file belonging to the logged-in user
-          const result = await pool.query(
-    `SELECT * FROM files
-     WHERE id = $1 AND user_id = $2`,
-    [fileId, req.user.userId]
-);
+            const result = await pool.query(
+                `SELECT *
+                 FROM files
+                 WHERE id = $1
+                 AND user_id = $2
+                 AND deleted_at IS NULL`,
+                [fileId, userId]
+            );
 
             if (result.rows.length === 0) {
                 return res.status(404).json({
@@ -196,7 +325,6 @@ router.get(
 
             const file = result.rows[0];
 
-            // Download from Supabase Storage
             const { data, error } = await supabase.storage
                 .from("files")
                 .download(file.storage_path);
